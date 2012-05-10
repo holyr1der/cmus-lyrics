@@ -13,30 +13,31 @@ import textwrap
 import curses
 import curses.wrapper
 from time import sleep
-from threading import Thread
+from threading import Thread, Lock
 
 locale.setlocale(locale.LC_ALL, '')
 
+FG_COLOR = (730, 730, 730)
 
-def wrap(text, cols):
+def wrap(text, cols, off_x=''):
     wt = ''
     for l in text.split('\n'):
         while len(l) > cols:
             wt += l[:cols - 2] + '->' + '\n'
             l = l[cols - 2:]
-        wt += l + '\n'
+        wt += off_x + l + '\n'
 
     return wt[:-1]
 
 
-def wrapwords(text, cols):
+def wrapwords(text, cols, off_x=''):
     wt = ''
     for l in text.split('\n'):
         for wl in textwrap.wrap(l, cols):
-            wt += wl.strip() + '\n'
+            wt += off_x + wl.strip() + '\n'
         wt += '\n'
 
-    return wt.strip()
+    return wt.rstrip()
 
 
 def metadata_get(type, artist, title):
@@ -126,6 +127,8 @@ class pianobar:
 
 class ui:
     def __init__(self, screen):
+        self.off_x = '   '
+        self.off_y = 2
         self.quit = False
         self.screen = screen
 
@@ -133,7 +136,11 @@ class ui:
         curses.noecho()
         curses.cbreak()
         curses.curs_set(0)
-        curses.use_default_colors()
+        curses.start_color()
+        #store old value of color 1
+        self.color1 = curses.color_content(1)
+        curses.init_color(1, *FG_COLOR)
+        curses.init_pair(1, 1, curses.COLOR_BLACK)
         self.screen.keypad(1)
 
         self.type = 'lyrics'
@@ -143,6 +150,10 @@ class ui:
         self.lyrics = ''
         self.artistbio = ''
 
+    def finalize(self):
+        #restore color 1
+        curses.init_color(1, *self.color1)
+
     def get_size(self):
         self.rows, self.cols = self.screen.getmaxyx()
 
@@ -151,19 +162,21 @@ class ui:
         if self.type == 'lyrics':
             self.header = self.artist + ' - ' + self.title
             self.text = self.lyrics
-            text_wrap = wrap(self.text, self.cols - 1)
+            text_wrap = wrap(self.text, self.cols - 1 - len(self.off_x), self.off_x)
         elif self.type == 'artistbio':
             self.header = self.artist
             self.text = self.artistbio
-            text_wrap = wrapwords(self.text, self.cols - 1)
-        header_wrap = wrap(self.header, self.cols - 1)
+            text_wrap = wrapwords(self.text, self.cols - 1 - len(self.off_x), self.off_x)
+        header_wrap = wrap(self.header, self.cols - 1 - len(self.off_x) , self.off_x)
         header_wrap_lines = len(header_wrap.split('\n'))
         text_wrap_lines = len(text_wrap.split('\n'))
         self.pad_lines = header_wrap_lines + 1 + text_wrap_lines
 
         self.pad = curses.newpad(self.pad_lines + self.rows, self.cols)
-        self.pad.addstr(0, 0, header_wrap, curses.A_BOLD)
-        self.pad.addstr(header_wrap_lines + 1, 0, text_wrap)
+        self.pad.addstr(self.off_y, 0, header_wrap,
+                curses.A_BOLD | curses.color_pair(1))
+        self.pad.addstr(self.off_y + header_wrap_lines + 1, 0,
+                text_wrap, curses.color_pair(1))
         self.pad.refresh(0, 0, 0, 0, self.rows - 1, self.cols)
 
     def control(self):
@@ -171,6 +184,7 @@ class ui:
             key = self.screen.getch()
 
             if key == ord('q'):
+                self.finalize()
                 self.quit = True
 
             else:
@@ -212,6 +226,18 @@ class ui:
 
                 self.pad.refresh(self.pos_y, 0, 0, 0, self.rows - 1, self.cols)
 
+def get_and_update(artist, title, data):
+    lyrics = metadata_get('lyrics', artist, title)
+    artistbio = metadata_get('artistbio', artist, title)
+    data['lock'].acquire()
+    try:
+        if data['ui'].artist + data['ui'].title == artist + title:
+            data['ui'].lyrics = lyrics #update(artist + ' - ' + title, data['lyric'].lyrics)
+            data['ui'].artistbio = artistbio #update(artist + ' - ' + title, data['lyric'].lyrics)
+            data['ui'].update()
+    finally:
+        data['lock'].release()
+
 
 def main(stdscr):
     if player == cmus:
@@ -227,6 +253,9 @@ def main(stdscr):
     ui_control.daemon = True
     ui_control.start()
 
+    lock = Lock()
+    data = {'ui' :  u, 'lock' : lock}
+
     while True:
         if u.quit == True:
             break
@@ -234,15 +263,18 @@ def main(stdscr):
         p.status()
 
         if p.artist != u.artist or p.title != u.title:
-            u.artist = p.artist
-            u.title = p.title
-            u.lyrics = 'Downloading lyrics...'
-            u.artistbio = 'Downloading artist info...'
-            u.update()
+            lock.acquire()
+            try:
+                u.artist = p.artist
+                u.title = p.title
+                u.lyrics = 'Downloading lyrics...'
+                u.artistbio = 'Downloading artist info...'
+                u.update()
+            finally:
+                lock.release()
 
-            u.lyrics = metadata_get('lyrics', p.artist, p.title)
-            u.artistbio = metadata_get('artistbio', p.artist, p.title)
-            u.update()
+            worker = Thread(target=get_and_update, args=(p.artist, p.title, data))
+            worker.start()
 
         sleep(1)
 
